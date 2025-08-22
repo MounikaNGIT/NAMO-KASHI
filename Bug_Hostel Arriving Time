@@ -1,3 +1,866 @@
-#Hostel Arriving time
-##Description
-**Arriving time of Hostel is not reflecting properly**
+import pandas as pd
+import openrouteservice
+import json
+from datetime import datetime, timedelta
+
+ORS_API_KEY = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6ImQ5ZTBiYmQwNDA4YzQzY2FhYjk1MmE2NTRlZTA4NGE0IiwiaCI6Im11cm11cjY0In0="
+MAX_WALKING_MINUTES_PER_DAY = 250
+QUEUE_MINUTES = 3
+STAY_MINUTES = 20
+HOSTEL_COORD = (82.981890, 25.320197)
+DURATION =3
+MAX_PLACES = 40
+START_DATE = "2025-08-14" 
+TEMPLE_TYPE = "any"  
+
+def ensure_temple_id(df: pd.DataFrame) -> pd.DataFrame:
+    if "Temple ID" not in df.columns:
+        df = df.copy()
+        df["Temple ID"] = range(1, len(df) + 1)
+    return df
+
+def filter_temples_by_ids(df: pd.DataFrame, ids: list[int]) -> pd.DataFrame:
+    if not ids:
+        return df.iloc[0:0].copy()  # empty
+    return df[df["Temple ID"].isin(ids)].reset_index(drop=True)
+
+
+
+def load_temples():
+    df = pd.read_excel("updatedsimple.xlsx")
+    df = ensure_temple_id(df)
+
+    df = df.drop_duplicates(subset=["Temple", "Latitude", "Longitude"]).reset_index(drop=True)
+    df = ensure_temple_id(df)
+    return df
+
+
+
+
+def append_distance_and_walk_time(current_idx, next_idx, distances_matrix, durations_matrix, distances_list, walk_times_list):
+    try:
+        dist_km = distances_matrix[current_idx][next_idx] / 1000
+        walk_time = round(durations_matrix[current_idx][next_idx] / 60, 2) 
+    except:
+        dist_km = pd.NA
+        walk_time = pd.NA
+
+    distances_list.append(round(dist_km, 2) if pd.notna(dist_km) else pd.NA)
+    walk_times_list.append(walk_time)
+
+
+def is_within_open_hours(arrival_time, row):
+    try:
+        morning_start = row['Morning Open Time']
+        morning_end = row['Morning Close Time']
+        evening_start = row['Evening Open Time']
+        evening_end = row['Evening Close Time']
+
+        arrival = arrival_time.time()
+
+        if morning_start <= arrival <= morning_end:
+            return True  
+        elif evening_start <= arrival <= evening_end:
+            return True  
+        else:
+            return False  
+
+    except Exception as e:
+        print(f"⚠️ Error checking hours for {row.get('Temple', 'Unknown')}: {e}")
+        return True  
+
+def create_durations_matrix(client, coords):
+    response = client.distance_matrix(
+        locations=coords,
+        profile='foot-walking',
+        metrics=['duration', 'distance'],
+        resolve_locations='false'
+    )
+    
+    return response['durations'], response['distances']
+def save_day_plan(day_num, visited, df, temple_indices, cumulative_walk_minutes, arrival_times, leave_time, arti_status_list, puja_status_list, special_today_list, queue_time_list, stay_time_list, previous_places, distances_from_previous, next_places, distances_to_next, start_time_list, temple_status_list, darshan_status_list, walk_time_to_this_place, today_date, output_prefix):
+    data = []
+    real_idx = 0  
+
+    for idx in visited:
+        if idx == -1:
+            data.append({
+                "Date": today_date.strftime("%Y-%m-%d"),
+                "Temple Name": "Return to Hostel",
+                "Latitude": HOSTEL_COORD[1],
+                "Longitude": HOSTEL_COORD[0],
+                "Start Time": start_time_list[real_idx] if real_idx < len(start_time_list) else "",
+                "Arrival Time": arrival_times[real_idx],
+                "Leave Time": leave_time[real_idx],
+                "Queue Time (min)": "N/A",
+                "Stay Time (min)":  "N/A",
+                "Previous Place": previous_places[real_idx] if real_idx < len(previous_places) else "",
+                "Distance from Previous (km)": distances_from_previous[real_idx] if real_idx < len(distances_from_previous) else "",
+                "Walk Time to This Place (min)": (
+                    walk_time_to_this_place[real_idx]
+                    if real_idx < len(walk_time_to_this_place)
+                    else (walk_time_to_this_place[-1] if walk_time_to_this_place else "")
+),
+                "Next Place": next_places[real_idx] if real_idx < len(next_places) else "",
+                "Distance to Next (km)": distances_to_next[real_idx] if real_idx < len(distances_to_next) else "",
+                "Temple Open": "N/A",
+                "Darshan Available": "N/A",
+                "Arti Status": "N/A",
+                "Puja Status": "N/A",
+                "Special Date Today": "N/A",
+                "Cumulative Walking Minutes": cumulative_walk_minutes[real_idx]
+            })
+        elif idx == -2:
+            data.append({
+                "Date": today_date.strftime("%Y-%m-%d"),
+                "Temple Name": "Break",
+                "Latitude": "",
+                "Longitude": "",
+                "Start Time": start_time_list[real_idx] if real_idx < len(start_time_list) else "",
+                "Arrival Time": arrival_times[real_idx],
+                "Leave Time": leave_time[real_idx],
+                "Queue Time (min)": "N/A",
+                "Stay Time (min)": stay_time_list[real_idx] if real_idx < len(stay_time_list) else "N/A",
+                "Previous Place": previous_places[real_idx] if real_idx < len(previous_places) else "",
+                "Distance from Previous (km)": distances_from_previous[real_idx] if real_idx < len(distances_from_previous) else "",
+                "Walk Time to This Place (min)": walk_time_to_this_place[real_idx] if real_idx < len(walk_time_to_this_place) else "",
+                "Next Place": next_places[real_idx] if real_idx < len(next_places) else "",
+                "Distance to Next (km)": distances_to_next[real_idx] if real_idx < len(distances_to_next) else "",
+                "Temple Open": "N/A",
+                "Darshan Available": "N/A",
+                "Arti Status": "N/A",
+                "Puja Status": "N/A",
+                "Special Date Today": "N/A",
+                "Cumulative Walking Minutes": cumulative_walk_minutes[real_idx]
+            })
+        elif idx == -3:
+            data.append({
+                "Date": today_date.strftime("%Y-%m-%d"),
+                "Temple Name": "Start from Hostel",
+                "Latitude": HOSTEL_COORD[1],
+                "Longitude": HOSTEL_COORD[0],
+                "Start Time": start_time_list[real_idx] if real_idx < len(start_time_list) else "",
+                "Arrival Time": arrival_times[real_idx],
+                "Leave Time": leave_time[real_idx],
+                "Queue Time (min)": "N/A",
+                "Stay Time (min)": "N/A",
+                "Previous Place": "N/A",
+                "Distance from Previous (km)": "N/A",
+                "Walk Time to This Place (min)": walk_time_to_this_place[real_idx] if real_idx < len(walk_time_to_this_place) else "",
+                "Next Place": "N/A",
+                "Distance to Next (km)": "N/A",
+                "Temple Open": "N/A",
+                "Darshan Available": "N/A",
+                "Arti Status": "N/A",
+                "Puja Status": "N/A",
+                "Special Date Today": "N/A",
+                "Cumulative Walking Minutes": cumulative_walk_minutes[real_idx]
+            })
+        elif idx >= 0:
+            row = df.iloc[idx]
+            data.append({
+                "Date": today_date.strftime("%Y-%m-%d"),
+                "Temple ID": row["Temple ID"],
+                "Temple Name": row["Temple"],
+                "Latitude": row["Latitude"],
+                "Longitude": row["Longitude"],
+                "Start Time": start_time_list[real_idx] if real_idx < len(start_time_list) else "",
+                "Arrival Time": arrival_times[real_idx],
+                "Leave Time": leave_time[real_idx],
+                "Queue Time (min)": queue_time_list[real_idx] if real_idx < len(queue_time_list) else "",
+                "Stay Time (min)": stay_time_list[real_idx] if real_idx < len(stay_time_list) else "",
+                "Previous Place": previous_places[real_idx] if real_idx < len(previous_places) else "",
+                "Distance from Previous (km)": distances_from_previous[real_idx] if real_idx < len(distances_from_previous) else "",
+                "Walk Time to This Place (min)": walk_time_to_this_place[real_idx] if real_idx < len(walk_time_to_this_place) else "",
+                "Next Place": next_places[real_idx] if real_idx < len(next_places) else "",
+                "Distance to Next (km)": distances_to_next[real_idx] if real_idx < len(distances_to_next) else "",
+                "Temple Open": temple_status_list[real_idx] if real_idx < len(temple_status_list) else "N/A",
+                "Darshan Available": darshan_status_list[real_idx] if real_idx < len(darshan_status_list) else "N/A",
+                "Arti Status": arti_status_list[real_idx] if real_idx < len(arti_status_list) else "N/A",
+                "Puja Status": puja_status_list[real_idx] if real_idx < len(puja_status_list) else "N/A",
+                "Special Date Today": special_today_list[real_idx] if real_idx < len(special_today_list) else "N/A",
+                "Cumulative Walking Minutes": cumulative_walk_minutes[real_idx]
+            })
+        else:
+            data.append({
+                "Date": today_date.strftime("%Y-%m-%d"),
+                "Temple Name": "Unknown",
+                "Latitude": "",
+                "Longitude": "",
+                "Start Time": start_time_list[real_idx] if real_idx < len(start_time_list) else "",
+                "Arrival Time": arrival_times[real_idx],
+                "Leave Time": leave_time[real_idx],
+                "Queue Time (min)": "",
+                "Stay Time (min)": "",
+                "Previous Place": previous_places[real_idx] if real_idx < len(previous_places) else "",
+                "Distance from Previous (km)": distances_from_previous[real_idx] if real_idx < len(distances_from_previous) else "",
+                "Walk Time to This Place (min)": walk_time_to_this_place[real_idx] if real_idx < len(walk_time_to_this_place) else "",
+                "Next Place": next_places[real_idx] if real_idx < len(next_places) else "",
+                "Distance to Next (km)": distances_to_next[real_idx] if real_idx < len(distances_to_next) else "",
+                "Temple Open": "N/A",
+                "Darshan Available": "N/A",
+                "Arti Status": "N/A",
+                "Puja Status": "N/A",
+                "Special Date Today": "N/A",
+                "Cumulative Walking Minutes": cumulative_walk_minutes[real_idx]
+            })
+
+        real_idx += 1  
+
+    output_df = pd.DataFrame(data)
+    output_df["Arrival Time"] = arrival_times[:len(output_df)]
+    output_df["Cumulative Walking Minutes"] = cumulative_walk_minutes[:len(output_df)]
+    output_df.to_excel(f"{output_prefix}_day{day_num}.xlsx", index=False)
+
+def generate_three_day_plan(df: pd.DataFrame, output_prefix: str, temple_type: str = TEMPLE_TYPE):
+    ors_client = openrouteservice.Client(key=ORS_API_KEY)
+    global today_date
+    today_date = datetime.strptime(START_DATE, "%Y-%m-%d")
+   
+    if temple_type.strip().lower() != "any":
+        allowed_types = [t.strip().lower() for t in temple_type.split(",")]
+
+        def match_type(cell_value):
+            if pd.isna(cell_value):
+                return False
+            cell_types = [t.strip().lower() for t in str(cell_value).split(",")]
+            return any(ct in allowed_types for ct in cell_types)
+
+        df = df[df["Temple Type"].apply(match_type)].reset_index(drop=True)
+        if df.empty:
+            print(f"⚠️ No temples found for types '{temple_type}'. Skipping plan.")
+            return
+        else:
+            print(f"🛕 Generating plan only for temple types: {temple_type} ({len(df)} temples)")
+    else:
+        print(f"🛕 Generating plan for all temple types ({len(df)} temples)")
+
+
+    df['Special Date'] = df['Special Date'].fillna('No')  
+    START_TIME = datetime.strptime("07:00", "%H:%M")
+    END_TIME = datetime.strptime("21:00", "%H:%M")
+
+    temple_coords = list(zip(df['Longitude'], df['Latitude']))
+    all_coords = [HOSTEL_COORD] + temple_coords
+
+    durations, distances = create_durations_matrix(ors_client, all_coords)
+
+    remaining = list(range(len(temple_coords))) 
+    day_num = 1
+    visited_overall =0
+
+    while remaining and day_num <= DURATION and visited_overall < MAX_PLACES:
+        today_date = datetime.strptime(START_DATE, "%Y-%m-%d") + timedelta(days=day_num - 1)
+        today_day = today_date.strftime("%A") 
+        arrival_times = []
+        arti_status_list = []
+        puja_status_list = []
+        special_today_list = []
+        queue_time_list = []
+        stay_time_list = []
+        previous_places = []
+        distances_from_previous = []
+        next_places = []
+        distances_to_next = []
+        start_time_list = []
+        leave_time = []
+        walk_history = []
+        skipped_today = []  
+        current_idx = 0  
+        visited_today = []
+        temple_status_list = []    
+        darshan_status_list = [] 
+        current_time = START_TIME
+        cumulative_walk = 0
+        walk_history = []
+        walk_time_to_this_place = []
+        leave_time = []
+        breaks_given = 0
+        MAX_BREAKS = 3
+        def get_break_duration(breaks_given):
+            return 60 if breaks_given == 1 else 30
+        next_break_time = START_TIME + timedelta(hours=3)
+        visited_today.append(-3)  
+        arrival_times.append(START_TIME.strftime("%H:%M") + " (Start)")
+        leave_time.append(START_TIME.strftime("%H:%M") + " (Start)")
+        previous_places.append("") 
+        distances_from_previous.append("")
+        next_places.append("")
+        distances_to_next.append("")
+        arti_status_list.append("N/A")
+        puja_status_list.append("N/A")
+        temple_status_list.append("N/A")
+        darshan_status_list.append("N/A")
+        special_today_list.append("N/A")
+        queue_time_list.append("")
+        stay_time_list.append("")
+        walk_history.append(0)
+        walk_time_to_this_place.append(0)
+        while remaining:
+            next_idx = None
+            min_walk = float('inf')
+
+            for i in remaining:
+                matrix_idx = i + 1
+                walk_time = durations[current_idx][matrix_idx] / 60  
+                if walk_time < min_walk:
+                    min_walk = walk_time
+                    next_idx = i
+            if next_idx is not None:
+                nearest_temple_row = df.iloc[next_idx]
+                nearest_temple_name = nearest_temple_row['Temple']
+                nearest_walk_time = min_walk
+                print(f"\n👀 Next closest temple: {nearest_temple_name} — {nearest_walk_time:.1f} min walk")
+
+
+            if next_idx is None:
+                break
+
+            to_temple = durations[current_idx][next_idx + 1] / 60
+            back_home = durations[next_idx + 1][0] / 60
+        
+            arrival_time = current_time + timedelta(minutes=to_temple)
+            temple_row = df.iloc[next_idx]
+
+            temple_name = temple_row['Temple']
+            raw_special = temple_row.get('Special Date')
+
+            is_special_today = False
+            if pd.notna(raw_special):
+                try:
+                    special_date = pd.to_datetime(raw_special, dayfirst=True).date()
+                    if special_date == today_date.date():
+                        is_special_today = True
+                except:
+                        print(f"⚠️ Couldn't parse Special Date for {temple_name}: {raw_special}")
+
+            if is_special_today:
+                queue_time = QUEUE_MINUTES * 5
+                stay_time = STAY_MINUTES * 2
+                print(f"🎉 Special Date TODAY for {temple_name} — Queue x5, Stay x2")
+            else:
+                queue_time = QUEUE_MINUTES
+                stay_time = STAY_MINUTES
+            
+                
+
+
+            temple_visit_minutes = queue_time + stay_time
+            leave_time_dt = arrival_time + timedelta(minutes=temple_visit_minutes)
+            
+            print(f"   → Queue: {queue_time} min | Stay: {stay_time} min | Total Visit: {temple_visit_minutes} min")
+
+            closed_day = temple_row.get('Closed Day', None)
+            if isinstance(closed_day, str) and closed_day.strip().lower() == today_day.lower():
+                print(f"🚫 Skipping {temple_name} — closed on {today_day}")
+                skipped_today.append(next_idx)
+                remaining.remove(next_idx)
+                continue
+
+            arrival_time = current_time + timedelta(minutes=to_temple)
+            arrival_clock = arrival_time.time()
+
+            morning_open = temple_row['Morning Open Time']
+            morning_close = temple_row['Morning Close Time']
+            evening_open = temple_row['Evening Open Time']
+            evening_close = temple_row['Evening Close Time']
+
+            wait_allowed = 10 
+
+            if arrival_clock < morning_open:
+                wait_minutes = (datetime.combine(today_date, morning_open) - datetime.combine(today_date, arrival_clock)).seconds // 60
+                if wait_minutes <= wait_allowed:
+                    print(f"🕒 Arrived before morning at {temple_name} — waiting {wait_minutes} minutes")
+                    arrival_time += timedelta(minutes=wait_minutes)
+                    current_time = arrival_time
+                else:
+                    print(f"⛔ Skipping {temple_name} — opens too late (wait {wait_minutes} min > {wait_allowed})")
+                    print(f"   → Arrival Time: {arrival_time.strftime('%H:%M')}")
+                    skipped_today.append(next_idx)
+                    remaining.remove(next_idx)
+                    continue
+
+            elif morning_close < arrival_clock < evening_open:
+                wait_minutes = (datetime.combine(today_date, evening_open) - datetime.combine(today_date, arrival_clock)).seconds // 60
+
+                if wait_minutes <= wait_allowed:
+                    print(f"🕒 Arrived before evening at {temple_name} — waiting {wait_minutes} minutes")
+                    arrival_time += timedelta(minutes=wait_minutes)
+                    current_time = arrival_time
+                else:
+                    print(f"⛔ Skipping {temple_name} — evening open too late (wait {wait_minutes} min > {wait_allowed})")
+                    print(f"   → Arrival Time: {arrival_time.strftime('%H:%M')}")
+                    skipped_today.append(next_idx)
+                    remaining.remove(next_idx)
+                    continue
+
+            elif arrival_clock > evening_close:
+                print(f"⛔ Skipping {temple_name} — already closed at {arrival_time.strftime('%H:%M')}")
+                skipped_today.append(next_idx)
+                remaining.remove(next_idx)
+                continue
+
+            else:
+                current_time = arrival_time
+                print(f"🕒 Reached {temple_name} at {arrival_time.strftime('%H:%M')} — Checking darshan slot")
+
+
+                def is_within_darshan(arrival_time, darshan_str):
+                    nonlocal cumulative_walk, current_time
+
+                    wait_allowed = 10  # minutes
+                    arrival = arrival_time.time()
+
+                    if isinstance(darshan_str, str) and darshan_str.strip().lower() == "any":
+                        in_morning = morning_open <= arrival <= morning_close
+                        in_evening = evening_open <= arrival <= evening_close
+                        if in_morning or in_evening:
+                            print(f"   ✅ 'Any' darshan allowed — arrival {arrival} is within {'morning' if in_morning else 'evening'} slot")
+                            return True
+                        else:
+                            print(f"   ❌ 'Any' darshan not allowed — arrival {arrival} is outside both morning and evening slots")
+                            return False
+
+                    if pd.isna(darshan_str) or " - " not in str(darshan_str):
+                        print(f"   ℹ️ No darshan time specified — allowing visit.")
+                        return True  # No darshan restriction
+
+                    try:
+                        start_str, end_str = darshan_str.split(" - ")
+                        start = datetime.strptime(start_str.strip(), "%H:%M:%S").time()
+                        end = datetime.strptime(end_str.strip(), "%H:%M:%S").time()
+
+                        if start <= arrival <= end:
+                            print(f"   📅 Darshan window: {start} to {end} — Arrival: {arrival} — ✅ Inside")
+                            return True
+                        elif arrival < start:
+                            wait_minutes = (datetime.combine(today_date, start) - datetime.combine(today_date, arrival)).seconds // 60
+                            if wait_minutes <= wait_allowed:
+                                print(f"   🕒 Arrived before darshan starts — waiting {wait_minutes} minutes (allowed)")
+                                arrival_time += timedelta(minutes=wait_minutes)
+                                current_time = arrival_time
+                                return True
+                            else:
+                                print(f"   ❌ Darshan not started — wait {wait_minutes} min > allowed {wait_allowed}")
+                                return False
+                        else:
+                            print(f"   ⛔ Arrival {arrival} is after darshan window ends at {end}")
+                            return False
+
+                    except Exception as e:
+                        print(f"   ⚠️ Error parsing darshan time: {e} — allowing visit.")
+                        return True
+
+                morning_darshan = temple_row['Morning Darshan Time']
+                evening_darshan = temple_row['Evening Darshan Time']
+    
+                in_morning_window = morning_open <= arrival_clock <= morning_close
+                in_evening_window = evening_open <= arrival_clock <= evening_close
+
+                if in_morning_window:
+                    print(f"   🔍 In morning time window ({morning_open}–{morning_close})")
+                    if not is_within_darshan(arrival_time, morning_darshan):
+                        print(f"⛔ {temple_name} — darshan not available at {arrival_time.strftime('%H:%M')} (morning slot) — will try tomorrow.")                        
+                        skipped_today.append(next_idx)
+                        remaining.remove(next_idx)               
+                        continue
+
+                elif in_evening_window:
+                    print(f"   🔍 In evening time window ({evening_open}–{evening_close})")
+                    if not is_within_darshan(arrival_time, evening_darshan):
+                        print(f"⛔ Skipping {temple_name} — darshan not available at {arrival_time.strftime('%H:%M')} (evening slot)")
+                        skipped_today.append(next_idx)
+                        remaining.remove(next_idx)
+                        continue
+                temple_status_list.append("Open")
+                darshan_status_list.append("Yes")
+                puja_start = temple_row.get("Puja Start Time", None)
+                puja_end = temple_row.get("Puja End Time", None)
+
+                def get_puja_status(arrival_time, start_str, end_str):
+                    if pd.isna(start_str) or pd.isna(end_str):
+                        return "No Puja Info"
+
+                    try:
+                        puja_start = datetime.strptime(str(start_str).strip(), "%H:%M:%S").time()
+                        puja_end = datetime.strptime(str(end_str).strip(), "%H:%M:%S").time()
+                        arrival = arrival_time.time()
+
+                        if puja_start <= arrival <= puja_end:
+                            return "Puja Attended"
+                        else:
+                            return "Missed Puja"
+
+                    except Exception as e:
+                        print(f"⚠️ Error parsing puja time: {e}")
+                        return "Invalid Puja Format"
+
+                
+
+                def check_arti_status_separate_columns(arrival_time, arti_start_str, arti_end_str):
+                    try:
+                        if pd.isna(arti_start_str) or pd.isna(arti_end_str):
+                            return "No Arti Info"
+
+                        arti_start = datetime.strptime(str(arti_start_str).strip(), "%H:%M:%S").time()
+                        arti_end = datetime.strptime(str(arti_end_str).strip(), "%H:%M:%S").time()
+                        arrival_clock = arrival_time.time()
+
+                        if arti_start <= arrival_clock <= arti_end:
+                            return "Arti Attended"
+                        else:
+                            return "No Arti"
+                    except Exception as e:
+                        print(f"⚠️ Error parsing arti time: {e}")
+                        return "Invalid Arti Format"
+
+
+
+                
+                
+
+                arti_start = temple_row.get("Arti Start Time", None)
+                arti_end = temple_row.get("Arti Close Time", None)
+
+                if pd.isna(arti_start) or pd.isna(arti_end):
+                    arti_status = "No Arti Info"
+                else:
+                    try:
+                        arti_start_time = datetime.strptime(str(arti_start).strip(), "%H:%M:%S").time()
+                        arti_end_time = datetime.strptime(str(arti_end).strip(), "%H:%M:%S").time()
+                        arrival_clock = arrival_time.time()
+
+                        if arti_start_time <= arrival_clock <= arti_end_time:
+                            arti_status = "Arti Attended"
+                        else:
+                            arti_status = "No Arti"
+                    except Exception as e:
+                        print(f"⚠️ Error parsing arti time for {temple_name}: {e}")
+                        arti_status = "Invalid Arti Format"
+
+
+                puja_start = temple_row.get("Puja Start Time", None)
+                puja_end = temple_row.get("Puja End Time", None)
+                puja_status = get_puja_status(arrival_time, puja_start, puja_end)
+                
+
+
+            return_home_time = leave_time_dt + timedelta(minutes=back_home)
+
+            if (cumulative_walk + to_temple + back_home > MAX_WALKING_MINUTES_PER_DAY) or (return_home_time > END_TIME):
+                if (cumulative_walk + to_temple + back_home > MAX_WALKING_MINUTES_PER_DAY):
+                    print(f"🛑 Day ended due to WALK LIMIT: {cumulative_walk:.2f} min used, "
+                    f"would become {cumulative_walk + to_temple + back_home:.2f} min > {MAX_WALKING_MINUTES_PER_DAY} min limit.")
+                if (return_home_time > END_TIME):
+                    print(f"🛑 Day ended due to TIME LIMIT: returning at {return_home_time.strftime('%H:%M')} "
+                    f"after {END_TIME.strftime('%H:%M')} cutoff.")
+                if next_idx is not None:
+                    cand_row = df.iloc[next_idx]
+                    cand_name = cand_row['Temple']
+                    
+                    walk_to_cand = to_temple
+                    walk_cand_to_hostel = back_home
+
+                if cumulative_walk + to_temple + back_home > MAX_WALKING_MINUTES_PER_DAY:
+                    reason = f"Walk limit exceeded ({cumulative_walk + to_temple + back_home:.1f} min > {MAX_WALKING_MINUTES_PER_DAY})"
+                elif return_home_time > END_TIME:
+                    reason = f"Return time {return_home_time.strftime('%H:%M')} exceeds cutoff {END_TIME.strftime('%H:%M')}"
+                else:
+                    reason = "Other scheduling constraint"
+
+                print(f"📋 End of Day Candidate: {cand_name}")
+                print(f"   ❌ Reason: {reason}")
+                print(f"   🚶 Walk to temple: {walk_to_cand:.1f} min")
+                print(f"   🏠 Walk from temple to hostel: {walk_cand_to_hostel:.1f} min")
+                break
+            time_if_visited = current_time + timedelta(minutes=to_temple + temple_visit_minutes + back_home)
+            if time_if_visited.time() > END_TIME.time():
+                break 
+            if breaks_given < MAX_BREAKS and current_time >= next_break_time:
+                visited_today.append(-2)  
+                break_start_time = datetime.strptime(leave_time[-1].split()[0], "%H:%M")
+                arrival_times.append(break_start_time.strftime("%H:%M"))
+                start_time_list.append(break_start_time.strftime("%H:%M")) 
+                current_time = break_start_time 
+
+                walk_history.append(round(cumulative_walk, 2))
+                actual_break_duration = get_break_duration(breaks_given)
+                print(f"🧘 Break inserted from {current_time.strftime('%H:%M')} to {(current_time + timedelta(minutes=actual_break_duration)).strftime('%H:%M')}")
+                leave_time.append((current_time + timedelta(minutes=actual_break_duration)).strftime("%H:%M") + " (Break)")
+                current_time += timedelta(minutes=actual_break_duration)
+                breaks_given += 1
+                next_break_time = current_time + timedelta(hours=3)
+
+                queue_time_list.append(0)
+                stay_time_list.append(actual_break_duration)
+
+                prev_temple_name = "Hostel"
+                for prev_idx in reversed(visited_today[:-1]):
+                    if prev_idx >= 0:
+                        prev_temple_name = df.iloc[prev_idx]['Temple']
+                        break
+                previous_places.append(prev_temple_name)
+
+
+                if remaining:
+                    min_next_idx = None
+                    min_dist = float('inf')
+                    for i in remaining:
+                        dist = distances[current_idx][i + 1] / 1000
+                        if dist < min_dist:
+                            min_dist = dist
+                            min_next_idx = i
+                    if min_next_idx is not None:
+                        next_place_name = df.iloc[min_next_idx]['Temple']
+                        if next_place_name == prev_temple_name:
+                            next_places.append("TBD")
+                        else:
+                            next_places.append(next_place_name)
+                        distances_to_next.append(round(min_dist, 2))
+                    else:
+                        next_places.append("Return to Hostel")
+                        distances_to_next.append("")
+                else:
+                    next_places.append("Return to Hostel")
+                    distances_to_next.append("")
+
+
+                arti_status_list.append("N/A")
+                puja_status_list.append("N/A")
+                special_today_list.append("N/A")
+                if distances_from_previous:
+                    distances_from_previous.append("N/A")
+                    walk_time_to_this_place.append("N/A")
+                else:
+                    distances_from_previous.append("N/A")
+                    walk_time_to_this_place.append("N/A")
+                continue
+
+            cumulative_walk += to_temple
+            walk_history.append(round(cumulative_walk, 2))
+            queue_time_list.append(queue_time)
+            stay_time_list.append(stay_time)
+            temple_status_list.append("Open")
+            darshan_status_list.append("Yes")
+            visited_today.append(next_idx)           
+            append_distance_and_walk_time(current_idx, next_idx + 1, distances, durations, distances_from_previous, walk_time_to_this_place)
+            puja_status_list.append(puja_status)
+            arti_status_list.append(arti_status)
+            special_today_list.append("Yes" if is_special_today else "No")
+            
+            prev_temple_name = "Hostel"
+            for prev_idx in reversed(visited_today[:-1]):
+                if prev_idx >= 0:
+                    prev_temple_name = df.iloc[prev_idx]['Temple']
+                    break
+            previous_places.append(prev_temple_name)
+
+
+            if current_idx == 0:
+                arrival_time = START_TIME + timedelta(minutes=to_temple)
+            else:
+                arrival_time = current_time + timedelta(minutes=to_temple)
+
+            arrival_times.append(arrival_time.strftime("%H:%M"))
+            leave_time.append((arrival_time + timedelta(minutes=temple_visit_minutes)).strftime("%H:%M"))
+
+
+            current_time = arrival_time + timedelta(minutes= temple_visit_minutes)
+
+            print(f"🛕 Visiting: {df.iloc[next_idx]['Temple']}")
+            print(f"   → Arrival Time: {arrival_time.strftime('%H:%M')}")
+            print(f"   → Queue: {queue_time} min | Stay: {stay_time} min | Total Visit: {temple_visit_minutes} min")
+            print(f"   → Departure Time: {current_time.strftime('%H:%M')}")
+            print(f"   → Cumulative Walk Time: {round(cumulative_walk, 2)} min\n")
+
+
+            remaining.remove(next_idx)
+            current_idx = next_idx + 1 
+            visited_overall += 1 
+            if visited_overall >= MAX_PLACES:
+                print(f"🛑 Reached MAX_PLACES ({MAX_PLACES}) — stopping further visits.")
+                break
+
+
+        if visited_today:           
+            if all(x < 0 for x in visited_today):
+                return_walk_time = 0
+                current_time = current_time 
+                cumulative_walk = cumulative_walk 
+
+                arrival_times.append(START_TIME.strftime("%H:%M") + " (Return to Hostel)")
+                leave_time.append(START_TIME.strftime("%H:%M") + " (Return to Hostel)")
+                queue_time_list.append("N/A")
+                stay_time_list.append("N/A")
+                next_places.append("")
+                distances_to_next.append("")
+                previous_places.append("Hostel")
+                walk_time_to_this_place.append(0)
+                distances_from_previous.append(0)
+                walk_history.append(round(cumulative_walk, 2))
+                visited_today.append(-1)
+
+                arti_status_list.append("N/A")
+                puja_status_list.append("N/A")
+                special_today_list.append("N/A")
+
+                print(f"🏁 Returning to hostel (no temples visited)")
+                print(f"   → Arrival Time at Hostel: {current_time.strftime('%H:%M')}")
+                print(f"   → Total Cumulative Walk Time: {round(cumulative_walk, 2)} min\n")
+
+            else:
+                last_visited_idx = visited_today[-1] + 1
+                return_walk_time = durations[last_visited_idx][0] / 60
+
+                current_time += timedelta(minutes=return_walk_time)
+                cumulative_walk += return_walk_time
+                arrival_times.append(START_TIME.strftime("%H:%M") + " (Return to Hostel)")
+                leave_time.append(START_TIME.strftime("%H:%M") + " (Return to Hostel)")
+
+
+                queue_time_list.append("")
+                stay_time_list.append("")
+                next_places.append("")
+                distances_to_next.append("")
+
+                for i in reversed(visited_today):
+                    if i >= 0:
+                        previous_places.append(df.iloc[i]['Temple'])
+                        break
+                else:
+                    previous_places.append("Hostel")
+
+                walk_time_back = round(durations[last_visited_idx][0] / 60, 2)
+                walk_time_to_this_place.append(walk_time_back)
+
+                append_distance_and_walk_time(last_visited_idx, 0, distances, durations, distances_from_previous, [])
+                walk_history.append(round(cumulative_walk, 2))
+                visited_today.append(-1)
+
+                arti_status_list.append("N/A")
+                puja_status_list.append("N/A")
+                special_today_list.append("N/A")
+
+                print(f"🏁 Returning to hostel")
+                print(f"   → Arrival Time at Hostel: {current_time.strftime('%H:%M')}")
+                print(f"   → Total Cumulative Walk Time: {round(cumulative_walk, 2)} min\n")
+
+        next_places = []
+        distances_to_next = []
+
+        for i in range(len(visited_today)):
+            curr_idx = visited_today[i]
+
+            if i + 1 >= len(visited_today):
+                next_places.append("Return to Hostel")
+                distances_to_next.append("N/A")
+                continue
+
+            next_idx = visited_today[i + 1]
+
+            if next_idx == -2:
+                next_places.append("Break")
+
+                look_ahead = None
+                for j in range(i + 2, len(visited_today)):
+                    if visited_today[j] >= 0:
+                        look_ahead = visited_today[j]
+                        break
+
+                if look_ahead is not None and curr_idx >= 0:
+                    dist_km = distances[curr_idx + 1][look_ahead + 1] / 1000
+                    distances_to_next.append(round(dist_km, 2))
+                else:
+                    distances_to_next.append("N/A")
+
+
+            elif curr_idx == -2:
+                next_places.append(df.iloc[next_idx]['Temple'])
+                distances_to_next.append("N/A")  
+
+            elif next_idx == -1:
+                next_places.append("Return to Hostel")
+                if curr_idx >= 0:
+                    dist_km = distances[curr_idx + 1][0] / 1000
+                    distances_to_next.append(round(dist_km, 2))
+                else:
+                    distances_to_next.append("N/A")
+
+            elif next_idx == -3:
+                next_places.append("Start from Hostel")
+                distances_to_next.append("N/A")
+
+            elif curr_idx == -3:
+                next_places.append(df.iloc[next_idx]['Temple'])
+                distances_to_next.append("N/A")
+
+            else:  
+                next_places.append(df.iloc[next_idx]['Temple'])
+                dist_km = distances[curr_idx + 1][next_idx + 1] / 1000
+                distances_to_next.append(round(dist_km, 2))
+        start_time_list = [START_TIME.strftime("%H:%M")]
+        for i in range(1, len(leave_time)):
+            start_time_list.append(leave_time[i - 1])
+        def pad_list(lst, target_length, pad_value=""):
+            while len(lst) < target_length:
+                lst.append(pad_value)
+        final_length = len(visited_today)
+
+        pad_list(distances_to_next, final_length, "N/A")
+
+        # ✅ Only save if at least one real temple was visited
+        if any(x >= 0 for x in visited_today):
+            save_day_plan(day_num, visited_today, df, remaining, walk_history, arrival_times, leave_time, arti_status_list, puja_status_list, special_today_list, queue_time_list, stay_time_list, previous_places, distances_from_previous, next_places, distances_to_next, start_time_list, temple_status_list, darshan_status_list, walk_time_to_this_place, today_date , output_prefix)
+            print(f"✅ Day {day_num}: {len([x for x in visited_today if x >= 0])} temples visited and saved.\n")
+        else:
+            print(f"⚠️ Day {day_num}: No temples visited — skipping output.\n")
+
+        remaining = list(set(remaining + skipped_today))
+
+        day_num += 1
+
+    print("🎉 All temples scheduled!")
+def plan_for_user_ids(ids: list[int], output_prefix: str = "custom", temple_type: str = TEMPLE_TYPE):
+    master_df = load_temples()
+    sel_df = filter_temples_by_ids(master_df, ids)
+    if temple_type.strip().lower() != "any":
+        allowed_types = [t.strip().lower() for t in temple_type.split(",")]
+
+        def match_type(cell_value):
+            if pd.isna(cell_value):
+                return False
+            cell_types = [t.strip().lower() for t in str(cell_value).split(",")]
+            return any(ct in allowed_types for ct in cell_types)
+
+        sel_df = sel_df[sel_df["Temple Type"].apply(match_type)].reset_index(drop=True)
+
+
+    if sel_df.empty:
+        print("⚠️ No valid Temple IDs provided for custom plan; skipping.")
+        return
+    print(f"🗂️ Custom selection: {len(sel_df)} temples | IDs: {ids}")
+    generate_three_day_plan(sel_df, output_prefix, temple_type)
+
+def main():
+    master_df = load_temples()
+    print("\n=== Generating Master 3-Day Plan ===")
+    generate_three_day_plan(master_df, output_prefix="master", temple_type=TEMPLE_TYPE)
+
+    try:
+        with open("user_ids.json", "r") as f:
+            user_ids_payload = json.load(f)
+        user_ids = user_ids_payload.get("ids", [])
+    except FileNotFoundError:
+        user_ids = []
+
+    if user_ids:
+        print("\n=== Generating Custom 3-Day Plan ===")
+        plan_for_user_ids(user_ids, output_prefix="custom")
+    else:
+        print("\nℹ️ No user IDs provided; skipping custom plan.")
+
+
+
+if __name__ == "__main__":
+    main()
+
